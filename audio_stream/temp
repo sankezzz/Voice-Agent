@@ -1,0 +1,337 @@
+from google.cloud import speech, texttospeech
+import pyaudio
+import os 
+import google.generativeai as genai
+import pygame
+import re
+import json 
+import datetime
+import time
+import numpy as np
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "creds.json"
+
+# Configure Gemini API
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+MODEL = "gemini-2.5-flash"
+generative_model = genai.GenerativeModel(MODEL)
+
+RATE = 16000
+CHUNK = int(RATE / 10)  # 100ms
+
+# Simple persistent booking state - Let LLM handle extraction
+booking_info = {
+    "pickup_location": "",
+    "drop_location": "",
+    "passenger_count": "",
+    "travel_date": "",
+    "trip_type": "",
+    "return_date": ""
+}
+
+def generate_audio_chunks():
+    p = pyaudio.PyAudio()
+    stream = p.open(format=pyaudio.paInt16,
+                    channels=1,
+                    rate=RATE,
+                    input=True,
+                    frames_per_buffer=CHUNK)
+    print("🎤 Listening... (Press Ctrl+C to stop current recording)")
+    
+    chunk_count = 0
+    max_chunks = 300  # 30 seconds max (300 chunks * 100ms each)
+    
+    try:
+        while chunk_count < max_chunks:
+            data = stream.read(CHUNK, exception_on_overflow=False)
+            chunk_count += 1
+            yield data
+    except KeyboardInterrupt:
+        print("\n⏹️ Recording stopped by user")
+    finally:
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+
+import sys
+import time as time_module
+
+def listen_print_loop(responses):
+    start_time = time_module.time()
+    timeout = 10  # 10 seconds timeout
+    partial_transcript = ""
+    
+    for response in responses:
+        current_time = time_module.time()
+        
+        # Timeout check
+        if current_time - start_time > timeout:
+            print(f"\n⏰ Timeout reached. Using partial: {partial_transcript}")
+            return partial_transcript if partial_transcript else "timeout"
+        
+        if not response.results:
+            continue
+
+        result = response.results[0]
+        if not result.alternatives:
+            continue
+
+        transcript = result.alternatives[0].transcript
+        partial_transcript = transcript  # Keep track of latest partial
+
+        if result.is_final:
+            sys.stdout.write(f"\r Final Transcript: {transcript}\n")
+            sys.stdout.flush()
+            return transcript
+        else:
+            sys.stdout.write(f"\r Partial: {transcript} ")
+            sys.stdout.flush()
+    
+    # If loop ends without final result, return partial
+    return partial_transcript if partial_transcript else "no_speech"
+
+def get_STT():
+    client = speech.SpeechClient()
+
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=RATE,
+        language_code="hi-IN",
+        enable_automatic_punctuation=True,
+        use_enhanced=True,  # Better quality
+        model="latest_long"  # Better for longer utterances
+    )
+    streaming_config = speech.StreamingRecognitionConfig(
+        config=config,
+        interim_results=True,
+        single_utterance=True,  # Stop after one complete utterance
+    )
+
+    print("🎤 Starting speech recognition...")
+    audio_generator = generate_audio_chunks()
+    requests = (speech.StreamingRecognizeRequest(audio_content=chunk) for chunk in audio_generator)
+
+    try:
+        responses = client.streaming_recognize(
+            config=streaming_config,
+            requests=requests
+        )
+
+        transcript = listen_print_loop(responses)
+        return transcript
+    except Exception as e:
+        print(f" Speech recognition error: {e}")
+        return "error"
+
+def get_json_from_gemini(output_text):
+    match = re.search(r'\{.*\}', output_text, re.DOTALL)
+    if match:
+        json_str = match.group(0).strip()
+
+        try:
+            parsed = json.loads(json_str)
+            print("Extracted JSON:", parsed)
+            return parsed
+        except json.JSONDecodeError as e:
+            print("JSON Decode Error:", e)
+            return {}
+    else:
+        print("No JSON found.")
+        return {}
+
+def get_gemini_results(transcript, buffer1, buffer2):
+    global booking_info
+    
+    date = datetime.date.today()
+    
+    # Let LLM handle information extraction and conversation naturally
+    all_conversation = ' '.join(buffer1) if buffer1 else ''
+    previous_responses = ' '.join(buffer2) if buffer2 else ''
+    
+    # Check if this is first interaction
+    is_first_interaction = len(buffer1) <= 1
+    
+    prompt = f'''
+You are Priya, a friendly cab booking assistant for कैबस्वाले app. Talk like a real human - warm, natural, and conversational.
+
+PERSONALITY:
+- You're helpful but not robotic
+- You chat naturally in Hindi/Hinglish mix
+- You remember what users tell you (very important!)
+- You're patient and understanding
+- You can have small talk while booking
+- You sound like a real person, not an AI
+
+CURRENT STORED BOOKING INFORMATION:
+- Pickup Location: "{booking_info['pickup_location']}"
+- Drop Location: "{booking_info['drop_location']}"
+- Passengers: "{booking_info['passenger_count']}"
+- Travel Date: "{booking_info['travel_date']}"
+- Trip Type: "{booking_info['trip_type']}"
+- Return Date: "{booking_info['return_date']}"
+
+CONVERSATION CONTEXT:
+- Full conversation so far: "{all_conversation}"
+- Your previous responses: "{previous_responses}"
+- Current user input: "{transcript}"
+- Today's date: {date}
+- Is this first interaction: {is_first_interaction}
+
+INSTRUCTIONS:
+1. **MEMORY IS KEY**: Look at stored booking information above. If something is already filled, NEVER ask for it again!
+
+2. **EXTRACT & UPDATE**: From the current conversation, identify any new booking details and respond with TWO parts:
+   
+   First, give a natural conversational response in Hindi/Hinglish.
+   
+   Then, provide a JSON update in this exact format:
+   ```json
+   {{
+     "pickup_location": "extracted_pickup_or_keep_existing",
+     "drop_location": "extracted_drop_or_keep_existing", 
+     "passenger_count": "extracted_count_or_keep_existing",
+     "travel_date": "extracted_date_or_keep_existing",
+     "trip_type": "extracted_type_or_keep_existing",
+     "return_date": "extracted_return_or_keep_existing"
+   }}
+   ```
+
+3. **CONVERSATION STYLE**:
+   - If first interaction and user greeted: Greet back warmly
+   - If continuing conversation: Don't repeat greetings
+   - Acknowledge what they just told you
+   - Ask for missing info naturally
+   - Keep responses short and conversational
+   - Use natural Hindi/English mixing
+
+4. **WHAT TO EXTRACT**:
+   - Any city/location names (pickup/drop)
+   - Date references (आज/today, कल/tomorrow, etc.)
+   - Trip type (one way, round trip, etc.)
+
+5. **NATURAL FLOW**:
+   - Don't ask multiple questions at once
+   - Chat a bit, don't just collect info
+   - If they ask about app features, answer briefly
+   - Keep it human and friendly
+
+Remember: You're Priya, not an AI assistant. Be natural and human-like!
+'''
+
+    try:
+        results = generative_model.generate_content(prompt)
+        output = results.text
+        
+        # Extract and update booking info from LLM response
+        json_data = get_json_from_gemini(output)
+        if json_data:
+            for key, value in json_data.items():
+                if key in booking_info and value and value.strip() and value != "keep_existing":
+                    if booking_info[key] != value:  # Only update if it's different
+                        booking_info[key] = value
+                        print(f" Updated {key}: {value}")
+        
+        # Return only the conversational part (remove JSON from response)
+        clean_output = re.sub(r'```json.*?```', '', output, flags=re.DOTALL).strip()
+        clean_output = re.sub(r'\{.*?\}', '', clean_output, flags=re.DOTALL).strip()
+        
+        return clean_output if clean_output else "हाँ, समझ गया। और बताइए?"
+        
+    except Exception as e:
+        print(f"Gemini Error: {e}")
+        return "माफ करिए, कुछ technical problem है। फिर से try करिए।"
+
+def get_TTS(output_text):
+    try:
+        tts_client = texttospeech.TextToSpeechClient()
+        synthesis_input = texttospeech.SynthesisInput(text=output_text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code='hi-IN', 
+            name="hi-IN-Wavenet-A",  
+            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16
+        )
+
+        tts_response = tts_client.synthesize_speech(
+            input=synthesis_input, voice=voice, audio_config=audio_config
+        )
+        print("TTS working and speaking")
+        with open("response.wav", "wb") as out:
+            out.write(tts_response.audio_content)
+
+        pygame.mixer.init()
+        pygame.mixer.music.load('response.wav')
+        pygame.mixer.music.play()
+
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
+
+        pygame.mixer.music.stop()
+        pygame.mixer.quit()
+        
+    except Exception as e:
+        print(f"TTS Error: {e}")
+
+if __name__ == "__main__":
+    print("🤖 कैबस्वाले Voice Assistant - Priya")
+    print("🎯 मुझसे Hindi/English में बात करें...")
+    print("💡 Tip: मैं आपकी बात याद रखूंगी, दोबारा नहीं पूछूंगी")
+    print("="*50)
+    
+    user_buffer = []
+    ai_buffer = []
+    
+    while True:
+        try:
+            # Show current booking state (for debugging)
+            print(f"\n📋 Current Booking Info:")
+            for key, value in booking_info.items():
+                if value:
+                    print(f"    {key.replace('_', ' ').title()}: {value}")
+                else:
+                    print(f"    {key.replace('_', ' ').title()}: Not provided")
+            
+            print("\n🎤 Ready to listen... (Speak now)")
+            user_transcript = get_STT()
+            
+            # Handle different transcript results
+            if user_transcript and user_transcript not in ["timeout", "error", "no_speech"]:
+                print(f"📝 You said: {user_transcript}")
+                user_buffer.append(user_transcript)
+                
+                print("🤔 Priya is thinking...")
+                gemini_results = get_gemini_results(user_transcript, user_buffer, ai_buffer)
+                ai_buffer.append(gemini_results)
+                
+                print(f"🗣️ Priya: {gemini_results}")
+                get_TTS(output_text=gemini_results)
+                
+                print("⏸️ Waiting 2 seconds...")
+                time.sleep(2)
+                print("✅ Ready for next input")
+                
+            elif user_transcript == "timeout":
+                print("⏰ No speech detected. Try again...")
+                time.sleep(1)
+                
+            elif user_transcript == "error":
+                print(" Speech recognition error. Retrying...")
+                time.sleep(2)
+                
+            else:
+                print("🔇 No speech detected. Try speaking louder...")
+                time.sleep(1)
+                
+        except KeyboardInterrupt:
+            print("\n Exiting...")
+            break
+        except Exception as e:
+            print(f" Unexpected error: {e}")
+            print(" Continuing in 3 seconds...")
+            time.sleep(3)
